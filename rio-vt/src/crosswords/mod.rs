@@ -2938,7 +2938,12 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
             NamedPrivateMode::GraphemeCluster => self.mode.insert(Mode::GRAPHEME_CLUSTER),
             NamedPrivateMode::ColorSchemeUpdates => {
-                self.mode.insert(Mode::COLOR_SCHEME_UPDATES)
+                self.mode.insert(Mode::COLOR_SCHEME_UPDATES);
+                // Report the current scheme immediately on subscribe
+                // (ghostty#209): clients like fish enable 2031 and never
+                // issue the `CSI ? 996 n` query, so without this they
+                // learn nothing until the next actual scheme change.
+                self.send_color_scheme_dsr(self.color_scheme_is_dark);
             }
             NamedPrivateMode::SyncUpdate => (),
         }
@@ -10643,8 +10648,13 @@ mod tests {
         term.report_color_scheme(true);
         assert!(events.borrow().is_empty(), "no event without DECSET 2031");
 
-        // Subscribe via DECSET 2031, then notify dark, then light.
+        // Subscribe via DECSET 2031: the current scheme (dark, the
+        // `Crosswords::new` default) is reported immediately, before
+        // any actual scheme change (ghostty#209 behavior).
         term.set_private_mode(NamedPrivateMode::ColorSchemeUpdates.into());
+        assert_eq!(collect_writes(&events), vec!["\x1b[?997;1n"]);
+
+        // Subscribed: dark/light changes are pushed.
         term.report_color_scheme(true);
         term.report_color_scheme(false);
         assert_eq!(
@@ -10652,14 +10662,124 @@ mod tests {
             vec!["\x1b[?997;1n", "\x1b[?997;2n"]
         );
 
+        // Unsubscribed again: changes are no longer pushed.
+        term.unset_private_mode(NamedPrivateMode::ColorSchemeUpdates.into());
+        term.report_color_scheme(true);
+        assert!(events.borrow().is_empty(), "no event after DECRST 2031");
+
         // DSR query `CSI ? 996 n` replies with the stored scheme,
         // regardless of DECSET 2031.
-        term.unset_private_mode(NamedPrivateMode::ColorSchemeUpdates.into());
         term.set_color_scheme(false);
         term.report_color_scheme_query();
         assert_eq!(collect_writes(&events), vec!["\x1b[?997;2n"]);
         term.set_color_scheme(true);
         term.report_color_scheme_query();
         assert_eq!(collect_writes(&events), vec!["\x1b[?997;1n"]);
+    }
+
+    /// Event-capturing listener shared by the parser-level 2031 tests.
+    #[derive(Clone)]
+    struct ColorSchemeListener {
+        events: std::rc::Rc<std::cell::RefCell<Vec<RioEvent>>>,
+    }
+
+    impl EventListener for ColorSchemeListener {
+        fn send_event(&self, event: RioEvent, _id: WindowId) {
+            self.events.borrow_mut().push(event);
+        }
+    }
+
+    fn color_scheme_term(
+    ) -> (
+        Crosswords<ColorSchemeListener>,
+        std::rc::Rc<std::cell::RefCell<Vec<RioEvent>>>,
+    ) {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let listener = ColorSchemeListener {
+            events: events.clone(),
+        };
+        let term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            listener,
+            WindowId::from(0),
+            0,
+            10_000,
+        );
+        (term, events)
+    }
+
+    fn pty_writes(events: &std::rc::Rc<std::cell::RefCell<Vec<RioEvent>>>) -> Vec<String> {
+        let writes: Vec<String> = events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                RioEvent::PtyWrite(_, text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        events.borrow_mut().clear();
+        writes
+    }
+
+    /// Drive the full parser path with raw byte sequences: DSR `CSI ? 996 n`
+    /// query, DECRQM `CSI ? 2031 $ p`, DECSET/DECRST 2031 subscribe with
+    /// immediate report, unsolicited push on scheme change, and silence
+    /// after unsubscribe.
+    #[test]
+    fn color_scheme_2031_protocol_end_to_end() {
+        use crate::performer::handler::Processor;
+
+        let (mut term, events) = color_scheme_term();
+        let mut parser = Processor::default();
+
+        // Query before any subscription answers with the current scheme
+        // (dark, the `Crosswords::new` default).
+        parser.advance(&mut term, b"\x1b[?996n");
+        // DECRQM: mode 2031 is supported and currently reset.
+        parser.advance(&mut term, b"\x1b[?2031$p");
+        // Subscribe: the current scheme is reported immediately.
+        parser.advance(&mut term, b"\x1b[?2031h");
+        // DECRQM now reports the mode as set.
+        parser.advance(&mut term, b"\x1b[?2031$p");
+        // Frontend pushes a scheme change to light; subscriber is notified.
+        term.set_color_scheme(false);
+        term.report_color_scheme(false);
+        // Query answers light.
+        parser.advance(&mut term, b"\x1b[?996n");
+        // Unsubscribe: further changes stay silent, but the one-shot
+        // query keeps working.
+        parser.advance(&mut term, b"\x1b[?2031l");
+        term.set_color_scheme(true);
+        term.report_color_scheme(true);
+        parser.advance(&mut term, b"\x1b[?996n");
+
+        assert_eq!(
+            pty_writes(&events),
+            vec![
+                "\x1b[?997;1n",   // query: dark
+                "\x1b[?2031;2$y", // DECRQM: mode reset
+                "\x1b[?997;1n",   // subscribe: immediate dark report
+                "\x1b[?2031;1$y", // DECRQM: mode set
+                "\x1b[?997;2n",   // unsolicited push: light
+                "\x1b[?997;2n",   // query: light
+                "\x1b[?997;1n",   // query after DECRST: dark again
+            ]
+        );
+    }
+
+    /// The immediate report on subscribe reflects the scheme that is
+    /// actually active, not a hardcoded default: a terminal already in
+    /// light mode must answer `997;2n` the moment 2031 is enabled.
+    #[test]
+    fn color_scheme_2031_immediate_report_follows_current_scheme() {
+        use crate::performer::handler::Processor;
+
+        let (mut term, events) = color_scheme_term();
+        let mut parser = Processor::default();
+
+        term.set_color_scheme(false);
+        parser.advance(&mut term, b"\x1b[?2031h");
+        assert_eq!(pty_writes(&events), vec!["\x1b[?997;2n"]);
     }
 }
